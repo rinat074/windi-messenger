@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: windi-messenger-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    depends_on:
+      - db
+      - redis
+      - centrifugo
+    env_file:
+      - .env
+    restart: always
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  db:
+    image: postgres:15
+    container_name: windi-messenger-db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=windi
+    ports:
+      - "5432:5432"
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: windi-messenger-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: always
+    command: redis-server --appendonly yes
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: windi-messenger-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    restart: always
+
+  centrifugo:
+    image: centrifugo/centrifugo:v3
+    container_name: windi-messenger-centrifugo
+    volumes:
+      - ./centrifugo:/centrifugo
+    ports:
+      - "8001:8000"  # API для клиентов
+      - "8002:8001"  # Административный веб-интерфейс
+    environment:
+      - CENTRIFUGO_TOKEN_HMAC_SECRET_KEY=${CENTRIFUGO_TOKEN_SECRET}
+      - CENTRIFUGO_API_KEY=${CENTRIFUGO_API_KEY}
+      - CENTRIFUGO_ADMIN_PASSWORD=${CENTRIFUGO_ADMIN_PASSWORD:-centrifugo}
+      - CENTRIFUGO_ADMIN_SECRET=${CENTRIFUGO_ADMIN_SECRET:-centrifugo_admin_secret}
+      - CENTRIFUGO_ALLOWED_ORIGINS=http://localhost:3000
+      - CENTRIFUGO_PROXY_CONNECT_ENDPOINT=http://api:8000/api/v1/centrifugo/connect
+      - CENTRIFUGO_PROXY_SUBSCRIBE_ENDPOINT=http://api:8000/api/v1/centrifugo/subscribe
+    command: centrifugo --config=/centrifugo/config.json --engine=redis --address=redis://redis:6379/0
+    restart: always
+    depends_on:
+      - redis
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data: 

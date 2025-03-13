@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Тест подключения к Centrifugo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"],
+        input[type="password"],
+        input[type="number"] {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background: #3498db;
+            border: none;
+            color: white;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background: #2980b9;
+        }
+        button:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        .actions {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .log-panel {
+            margin-top: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+            background: #f9f9f9;
+            font-family: monospace;
+        }
+        .log-item {
+            margin-bottom: 5px;
+            padding: 5px;
+            border-left: 3px solid #ddd;
+        }
+        .log-info {
+            border-left-color: #3498db;
+        }
+        .log-success {
+            border-left-color: #2ecc71;
+        }
+        .log-error {
+            border-left-color: #e74c3c;
+        }
+        .status {
+            display: inline-block;
+            padding: 3px 6px;
+            border-radius: 3px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        .status-connected {
+            background: #2ecc71;
+            color: white;
+        }
+        .status-disconnected {
+            background: #e74c3c;
+            color: white;
+        }
+        .presence-list {
+            margin-top: 15px;
+            background: white;
+            padding: 10px;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .presence-item {
+            padding: 5px;
+            margin-bottom: 5px;
+            border-bottom: 1px solid #eee;
+        }
+        .message-form {
+            margin-top: 15px;
+            padding: 15px;
+            background: #f0f9ff;
+            border-radius: 4px;
+            border: 1px solid #d6eaf8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Тест подключения к Centrifugo <span id="connection-status" class="status status-disconnected">Отключено</span></h1>
+        
+        <div class="form-group">
+            <label for="api-url">URL API:</label>
+            <input type="text" id="api-url" value="http://localhost:8000/api/v1" />
+        </div>
+        
+        <div class="form-group">
+            <label for="centrifugo-url">URL Centrifugo WebSocket:</label>
+            <input type="text" id="centrifugo-url" value="ws://localhost:8001/connection/websocket" />
+        </div>
+        
+        <div class="form-group">
+            <label for="email">Email:</label>
+            <input type="text" id="email" placeholder="user@example.com" />
+        </div>
+        
+        <div class="form-group">
+            <label for="password">Пароль:</label>
+            <input type="password" id="password" placeholder="Ваш пароль" />
+        </div>
+        
+        <div class="actions">
+            <button id="login-btn">Войти</button>
+            <button id="connect-btn" disabled>Подключиться к Centrifugo</button>
+            <button id="disconnect-btn" disabled>Отключиться</button>
+        </div>
+        
+        <div id="subscription-panel" style="display: none; margin-top: 20px;">
+            <h3>Подписки</h3>
+            <div class="form-group">
+                <label for="chat-id">ID чата для подписки:</label>
+                <input type="number" id="chat-id" placeholder="Введите ID чата" />
+                <button id="subscribe-btn" style="margin-top: 10px;">Подписаться на чат</button>
+            </div>
+            
+            <div id="presence-panel" style="display: none; margin-top: 15px;">
+                <h4>Пользователи в чате:</h4>
+                <div id="presence-list" class="presence-list"></div>
+            </div>
+            
+            <div class="message-form">
+                <div class="form-group">
+                    <label for="message-text">Сообщение:</label>
+                    <input type="text" id="message-text" placeholder="Введите текст сообщения" />
+                </div>
+                <button id="send-btn">Отправить</button>
+            </div>
+        </div>
+        
+        <h3>Лог событий:</h3>
+        <div id="log-panel" class="log-panel"></div>
+    </div>
+
+    <script type="module">
+        import { Centrifuge } from 'https://cdn.jsdelivr.net/npm/centrifuge@3.1.0/dist/centrifuge.min.js';
+        
+        // DOM элементы
+        const apiUrlInput = document.getElementById('api-url');
+        const centrifugoUrlInput = document.getElementById('centrifugo-url');
+        const emailInput = document.getElementById('email');
+        const passwordInput = document.getElementById('password');
+        const loginBtn = document.getElementById('login-btn');
+        const connectBtn = document.getElementById('connect-btn');
+        const disconnectBtn = document.getElementById('disconnect-btn');
+        const chatIdInput = document.getElementById('chat-id');
+        const subscribeBtn = document.getElementById('subscribe-btn');
+        const messageTextInput = document.getElementById('message-text');
+        const sendBtn = document.getElementById('send-btn');
+        const logPanel = document.getElementById('log-panel');
+        const connectionStatus = document.getElementById('connection-status');
+        const subscriptionPanel = document.getElementById('subscription-panel');
+        const presencePanel = document.getElementById('presence-panel');
+        const presenceList = document.getElementById('presence-list');
+        
+        // Состояние приложения
+        let state = {
+            apiUrl: apiUrlInput.value,
+            centrifugoUrl: centrifugoUrlInput.value,
+            authToken: null,
+            centrifugoToken: null,
+            centrifuge: null,
+            subscriptions: {},
+            user: null,
+            currentChatId: null
+        };
+        
+        // Логирование событий
+        function log(message, type = 'info') {
+            const logItem = document.createElement('div');
+            logItem.className = `log-item log-${type}`;
+            logItem.innerText = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logPanel.appendChild(logItem);
+            logPanel.scrollTop = logPanel.scrollHeight;
+        }
+        
+        // Авторизация пользователя
+        async function login() {
+            try {
+                log('Авторизация пользователя...');
+                
+                const response = await fetch(`${state.apiUrl}/users/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        email: emailInput.value,
+                        password: passwordInput.value
+                    })
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Ошибка авторизации');
+                }
+                
+                const data = await response.json();
+                state.authToken = data.access_token;
+                
+                log('Авторизация успешна!', 'success');
+                connectBtn.disabled = false;
+                
+                // Получаем информацию о пользователе
+                await getCurrentUser();
+                
+                return true;
+            } catch (error) {
+                log(`Ошибка при авторизации: ${error.message}`, 'error');
+                return false;
+            }
+        }
+        
+        // Получение информации о текущем пользователе
+        async function getCurrentUser() {
+            try {
+                log('Получение информации о пользователе...');
+                
+                const response = await fetch(`${state.apiUrl}/users/me`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${state.authToken}`
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Не удалось получить информацию о пользователе');
+                }
+                
+                state.user = await response.json();
+                log(`Получена информация о пользователе: ${state.user.username || state.user.email}`, 'success');
+                
+                return state.user;
+            } catch (error) {
+                log(`Ошибка при получении информации о пользователе: ${error.message}`, 'error');
+                return null;
+            }
+        }
+        
+        // Получение токена для подключения к Centrifugo
+        async function getCentrifugoToken() {
+            try {
+                log('Получение токена Centrifugo...');
+                
+                const response = await fetch(`${state.apiUrl}/centrifugo/token`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${state.authToken}`
+                    }
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Не удалось получить токен Centrifugo');
+                }
+                
+                const data = await response.json();
+                state.centrifugoToken = data.token;
+                log('Токен Centrifugo получен', 'success');
+                
+                return state.centrifugoToken;
+            } catch (error) {
+                log(`Ошибка при получении токена Centrifugo: ${error.message}`, 'error');
+                return null;
+            }
+        }
+        
+        // Подключение к Centrifugo
+        async function connectToCentrifugo() {
+            try {
+                if (!state.authToken) {
+                    throw new Error('Сначала выполните вход');
+                }
+                
+                // Получаем токен для подключения
+                await getCentrifugoToken();
+                
+                if (!state.centrifugoToken) {
+                    throw new Error('Не удалось получить токен Centrifugo');
+                }
+                
+                log('Подключение к Centrifugo...');
+                
+                // Создаем экземпляр Centrifuge
+                state.centrifuge = new Centrifuge(state.centrifugoUrl, {
+                    token: state.centrifugoToken
+                });
+                
+                // Обработчики событий соединения
+                state.centrifuge.on('connecting', (context) => {
+                    log(`Подключение к Centrifugo... Попытка №${context.attempt}`);
+                });
+                
+                state.centrifuge.on('connected', (context) => {
+                    log('Подключено к Centrifugo!', 'success');
+                    connectionStatus.textContent = 'Подключено';
+                    connectionStatus.className = 'status status-connected';
+                    disconnectBtn.disabled = false;
+                    subscriptionPanel.style.display = 'block';
+                });
+                
+                state.centrifuge.on('disconnected', (context) => {
+                    log(`Отключено от Centrifugo: ${context.reason}`);
+                    connectionStatus.textContent = 'Отключено';
+                    connectionStatus.className = 'status status-disconnected';
+                    disconnectBtn.disabled = true;
+                    subscriptionPanel.style.display = 'none';
+                    presencePanel.style.display = 'none';
+                });
+                
+                state.centrifuge.on('error', (context) => {
+                    log(`Ошибка соединения с Centrifugo: ${context.error}`, 'error');
+                });
+                
+                // Подключаемся
+                state.centrifuge.connect();
+                
+                return true;
+            } catch (error) {
+                log(`Ошибка при подключении к Centrifugo: ${error.message}`, 'error');
+                return false;
+            }
+        }
+        
+        // Отключение от Centrifugo
+        function disconnectFromCentrifugo() {
+            if (state.centrifuge) {
+                state.centrifuge.disconnect();
+                state.subscriptions = {};
+                state.currentChatId = null;
+                log('Отключено от Centrifugo');
+            }
+        }
+        
+        // Подписка на канал чата
+        function subscribeToChat(chatId) {
+            try {
+                if (!state.centrifuge) {
+                    throw new Error('Нет активного подключения к Centrifugo');
+                }
+                
+                const chatChannel = `chat:${chatId}`;
+                log(`Подписка на канал ${chatChannel}...`);
+                
+                // Если уже есть подписка на этот канал, отписываемся
+                if (state.subscriptions[chatChannel]) {
+                    state.subscriptions[chatChannel].unsubscribe();
+                    delete state.subscriptions[chatChannel];
+                }
+                
+                const subscription = state.centrifuge.newSubscription(chatChannel);
+                
+                subscription.on('subscribing', (context) => {
+                    log(`Подписка на канал ${chatChannel}... Попытка №${context.attempt}`);
+                });
+                
+                subscription.on('subscribed', (context) => {
+                    log(`Подписка на канал ${chatChannel} выполнена успешно`, 'success');
+                    state.currentChatId = chatId;
+                    presencePanel.style.display = 'block';
+                    updatePresence(chatId);
+                });
+                
+                subscription.on('unsubscribed', (context) => {
+                    log(`Отписка от канала ${chatChannel}: ${context.reason}`);
+                    if (state.currentChatId === chatId) {
+                        presencePanel.style.display = 'none';
+                    }
+                });
+                
+                subscription.on('publication', (context) => {
+                    log(`Получено сообщение в канале ${chatChannel}: ${JSON.stringify(context.data)}`, 'success');
+                });
+                
+                subscription.on('join', (context) => {
+                    log(`Пользователь присоединился к каналу ${chatChannel}: ${JSON.stringify(context)}`, 'info');
+                    updatePresence(chatId);
+                });
+                
+                subscription.on('leave', (context) => {
+                    log(`Пользователь покинул канал ${chatChannel}: ${JSON.stringify(context)}`, 'info');
+                    updatePresence(chatId);
+                });
+                
+                subscription.on('error', (context) => {
+                    log(`Ошибка подписки на канал ${chatChannel}: ${context.error}`, 'error');
+                });
+                
+                // Подписываемся
+                subscription.subscribe();
+                
+                // Сохраняем подписку
+                state.subscriptions[chatChannel] = subscription;
+                
+                return true;
+            } catch (error) {
+                log(`Ошибка при подписке на канал: ${error.message}`, 'error');
+                return false;
+            }
+        }
+        
+        // Отправка сообщения в чат
+        async function sendMessage(chatId, text) {
+            try {
+                if (!state.authToken) {
+                    throw new Error('Требуется авторизация');
+                }
+                
+                log(`Отправка сообщения в чат ${chatId}...`);
+                
+                const response = await fetch(`${state.apiUrl}/centrifugo/publish?chat_id=${chatId}`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${state.authToken}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        content: text,
+                        attachments: []
+                    })
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Не удалось отправить сообщение');
+                }
+                
+                const data = await response.json();
+                log(`Сообщение успешно отправлено: ${data.id || 'ID не указан'}`, 'success');
+                
+                return true;
+            } catch (error) {
+                log(`Ошибка при отправке сообщения: ${error.message}`, 'error');
+                return false;
+            }
+        }
+        
+        // Получение данных о пользователях в чате
+        async function updatePresence(chatId) {
+            try {
+                if (!state.authToken) {
+                    throw new Error('Требуется авторизация');
+                }
+                
+                log(`Получение данных о пользователях в чате ${chatId}...`);
+                
+                const response = await fetch(`${state.apiUrl}/centrifugo/presence/${chatId}`, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${state.authToken}`
+                    }
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Не удалось получить данные о присутствии');
+                }
+                
+                const data = await response.json();
+                log(`Данные о присутствии в чате ${chatId} получены`, 'success');
+                
+                // Обновляем список пользователей
+                presenceList.innerHTML = '';
+                
+                if (data.clients && Object.keys(data.clients).length > 0) {
+                    for (const [clientId, client] of Object.entries(data.clients)) {
+                        const presenceItem = document.createElement('div');
+                        presenceItem.className = 'presence-item';
+                        
+                        const userName = client.info?.name || client.user || clientId;
+                        presenceItem.innerText = `👤 ${userName}`;
+                        
+                        presenceList.appendChild(presenceItem);
+                    }
+                } else {
+                    const emptyMessage = document.createElement('div');
+                    emptyMessage.className = 'presence-item';
+                    emptyMessage.innerText = 'Нет активных пользователей в чате';
+                    presenceList.appendChild(emptyMessage);
+                }
+                
+                return data;
+            } catch (error) {
+                log(`Ошибка при получении данных о присутствии: ${error.message}`, 'error');
+                return null;
+            }
+        }
+        
+        // Обработчики событий кнопок
+        loginBtn.addEventListener('click', async () => {
+            state.apiUrl = apiUrlInput.value;
+            await login();
+        });
+        
+        connectBtn.addEventListener('click', async () => {
+            state.centrifugoUrl = centrifugoUrlInput.value;
+            await connectToCentrifugo();
+        });
+        
+        disconnectBtn.addEventListener('click', () => {
+            disconnectFromCentrifugo();
+        });
+        
+        subscribeBtn.addEventListener('click', () => {
+            const chatId = parseInt(chatIdInput.value);
+            if (isNaN(chatId) || chatId <= 0) {
+                log('Укажите корректный ID чата', 'error');
+                return;
+            }
+            subscribeToChat(chatId);
+        });
+        
+        sendBtn.addEventListener('click', async () => {
+            const chatId = state.currentChatId;
+            const text = messageTextInput.value;
+            
+            if (!chatId) {
+                log('Сначала подпишитесь на канал чата', 'error');
+                return;
+            }
+            
+            if (!text) {
+                log('Введите текст сообщения', 'error');
+                return;
+            }
+            
+            await sendMessage(chatId, text);
+            messageTextInput.value = '';
+        });
+        
+        // Инициализация
+        log('Tестер подключения к Centrifugo инициализирован. Выполните вход для продолжения.', 'info');
+    </script>
+</body>
+</html> 

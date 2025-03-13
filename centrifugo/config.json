@@ -1,0 +1,38 @@
+{
+  "token_hmac_secret_key": "change-this-to-a-long-random-string-in-production",
+  "api_key": "change-this-to-a-long-random-string-in-production",
+  "admin_password": "centrifugo",
+  "admin_secret": "centrifugo_admin_secret",
+  "admin": true,
+  "allowed_origins": ["http://localhost:3000"],
+  "proxy_connect_endpoint": "http://api:8000/api/v1/centrifugo/connect",
+  "proxy_subscribe_endpoint": "http://api:8000/api/v1/centrifugo/subscribe",
+  "presence": true,
+  "history_size": 100,
+  "history_ttl": "48h",
+  "namespaces": [
+    {
+      "name": "chat",
+      "presence": true,
+      "join_leave": true,
+      "history_size": 100,
+      "history_ttl": "48h",
+      "allow_publish": false
+    }
+  ],
+  "redis": {
+    "address": "redis://redis:6379/0",
+    "prefix": "centrifugo"
+  },
+  "client_insecure": false,
+  "debug": false,
+  "port": 8000,
+  "admin_port": 8001,
+  "health_port": 8002,
+  "health": true,
+  "prometheus": true,
+  "v3_use_offset": true,
+  "ping_interval": 25,
+  "node_info_metrics": true,
+  "client_connection_limit_per_node": 10000
+} 

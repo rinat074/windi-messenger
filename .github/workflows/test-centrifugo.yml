@@ -1,0 +1,178 @@
+name: Test Centrifugo Integration
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'app/core/centrifugo.py'
+      - 'app/api/routes/centrifugo_routes.py'
+      - 'centrifugo/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/test-centrifugo.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'app/core/centrifugo.py'
+      - 'app/api/routes/centrifugo_routes.py'
+      - 'centrifugo/**'
+      - 'docker-compose.yml'
+      - '.github/workflows/test-centrifugo.yml'
+  workflow_dispatch:
+
+jobs:
+  test_centrifugo:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Create .env file
+        run: |
+          cat > .env << EOF
+          # Основные настройки 
+          PROJECT_NAME=WinDI Messenger
+          ENVIRONMENT=testing
+          DEBUG=true
+          API_V1_STR=/api/v1
+          
+          # Настройки безопасности
+          SECRET_KEY=github-actions-test-key
+          ACCESS_TOKEN_EXPIRE_MINUTES=60
+          ALGORITHM=HS256
+          
+          # Настройки CORS
+          CORS_ORIGINS=http://localhost:3000
+          
+          # Настройки базы данных
+          DATABASE_URI=postgresql+asyncpg://postgres:postgres@db:5432/windi_test
+          
+          # Настройки Redis
+          REDIS_URI=redis://redis:6379/0
+          
+          # Настройки Centrifugo
+          CENTRIFUGO_URL=http://centrifugo:8000
+          CENTRIFUGO_API_KEY=github-actions-test-api-key
+          CENTRIFUGO_TOKEN_SECRET=github-actions-test-token-secret
+          CENTRIFUGO_TOKEN_EXPIRE_SECONDS=3600
+          CENTRIFUGO_ADMIN_PASSWORD=admin
+          CENTRIFUGO_ADMIN_SECRET=admin
+          CENTRIFUGO_DEBUG=true
+          EOF
+      
+      - name: Create centrifugo config
+        run: |
+          mkdir -p centrifugo
+          cat > centrifugo/config.json << EOF
+          {
+            "token_hmac_secret_key": "github-actions-test-token-secret",
+            "api_key": "github-actions-test-api-key",
+            "admin_password": "admin",
+            "admin_secret": "admin",
+            "admin": true,
+            "allowed_origins": ["http://localhost:3000"],
+            "proxy_connect_endpoint": "http://api:8000/api/v1/centrifugo/connect",
+            "proxy_subscribe_endpoint": "http://api:8000/api/v1/centrifugo/subscribe",
+            "presence": true,
+            "history_size": 100,
+            "history_ttl": "48h",
+            "namespaces": [
+              {
+                "name": "chat",
+                "presence": true,
+                "join_leave": true,
+                "history_size": 100,
+                "history_ttl": "48h",
+                "allow_publish": false
+              }
+            ],
+            "redis": {
+              "address": "redis://redis:6379/0",
+              "prefix": "centrifugo"
+            },
+            "client_insecure": false,
+            "debug": true,
+            "port": 8000,
+            "admin_port": 8001,
+            "health_port": 8002,
+            "health": true,
+            "prometheus": true
+          }
+          EOF
+      
+      - name: Build and start services
+        run: |
+          docker-compose up -d
+          echo "Waiting for services to start..."
+          sleep 30
+      
+      - name: Check service status
+        run: docker-compose ps
+      
+      - name: Check service logs
+        if: always()
+        run: |
+          echo "=== API Logs ==="
+          docker-compose logs api | tail -n 50
+          echo "=== Centrifugo Logs ==="
+          docker-compose logs centrifugo | tail -n 50
+      
+      - name: Create test users and data
+        run: |
+          docker-compose exec -T api python scripts/create_test_data.py --force
+      
+      - name: Install dependencies for testing
+        run: |
+          pip install httpx websockets asyncio python-jose[cryptography] python-dotenv
+      
+      - name: Run Centrifugo integration tests
+        run: |
+          docker-compose exec -T api python scripts/test_centrifugo_integration.py
+      
+      - name: Check Centrifugo health
+        if: always()
+        run: |
+          curl -v http://localhost:8001/health
+      
+      - name: Collect debug information if tests fail
+        if: failure()
+        run: |
+          echo "=== API routes ===" > debug.txt
+          docker-compose exec -T api python -c "import importlib.util; import app.api.routes; print(dir(app.api.routes))" >> debug.txt
+          
+          echo "=== Environment variables ===" >> debug.txt
+          docker-compose exec -T api env | grep -v PASSWORD | grep -v SECRET >> debug.txt
+          
+          echo "=== Network configuration ===" >> debug.txt
+          docker network inspect windi-messenger_default >> debug.txt
+          
+          echo "=== Docker processes ===" >> debug.txt
+          docker ps -a >> debug.txt
+          
+          echo "=== API logs ===" >> debug.txt
+          docker-compose logs api >> debug.txt
+          
+          echo "=== Centrifugo logs ===" >> debug.txt
+          docker-compose logs centrifugo >> debug.txt
+          
+          echo "=== DB logs ===" >> debug.txt
+          docker-compose logs db >> debug.txt
+          
+          echo "=== Redis logs ===" >> debug.txt
+          docker-compose logs redis >> debug.txt
+      
+      - name: Upload debug information
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: debug-info
+          path: debug.txt
+      
+      - name: Cleanup
+        if: always()
+        run: docker-compose down -v 
