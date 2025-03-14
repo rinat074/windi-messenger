@@ -1,287 +1,303 @@
 """
-Модуль для сбора и экспорта метрик Prometheus
+Модуль для сбора и экспорта метрик приложения
+
+Этот модуль предоставляет функции для сбора метрик производительности,
+использования ресурсов и бизнес-метрик приложения.
 """
 import time
-from typing import Callable
+import logging
+import functools
+from typing import Dict, Any, Optional, Callable
+from datetime import datetime
 
-from fastapi import FastAPI, Request, Response
-from prometheus_client import Counter, Gauge, Histogram, Summary
-from prometheus_client.openmetrics.exposition import generate_latest
-from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi import Request, Response
+from prometheus_client import Counter, Histogram, Gauge, CollectorRegistry, push_to_gateway
 
-from app.core.config import settings
-from app.core.logging import get_logger
+# Настройка логирования
+logger = logging.getLogger(__name__)
 
-# Логгер для модуля метрик
-logger = get_logger("metrics")
+# Создаем реестр метрик
+registry = CollectorRegistry()
 
-# Метрики HTTP-запросов
-REQUEST_COUNT = Counter(
-    "app_request_count", 
-    "Количество HTTP-запросов",
-    ["method", "endpoint", "status"]
+# Метрики HTTP запросов
+http_requests_total = Counter(
+    'http_requests_total', 
+    'Общее количество HTTP запросов',
+    ['method', 'endpoint', 'status'],
+    registry=registry
 )
 
-REQUEST_LATENCY = Histogram(
-    "app_request_latency_seconds", 
-    "Время обработки HTTP-запросов",
-    ["method", "endpoint"]
+http_request_duration_seconds = Histogram(
+    'http_request_duration_seconds',
+    'Длительность HTTP запросов в секундах',
+    ['method', 'endpoint'],
+    buckets=(0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, float('inf')),
+    registry=registry
 )
 
 # Метрики WebSocket
-WEBSOCKET_CONNECTIONS = Gauge(
-    "app_websocket_connections", 
-    "Количество активных WebSocket-соединений"
+ws_connections_active = Gauge(
+    'ws_connections_active',
+    'Количество активных WebSocket соединений',
+    ['channel_type'],
+    registry=registry
 )
 
-WEBSOCKET_MESSAGES = Counter(
-    "app_websocket_messages", 
-    "Количество сообщений через WebSocket",
-    ["direction", "type"]
+ws_messages_total = Counter(
+    'ws_messages_total',
+    'Общее количество WebSocket сообщений',
+    ['direction', 'message_type'],
+    registry=registry
 )
 
-# Метрики аутентификации
-LOGIN_SUCCESS = Counter(
-    "app_login_success", 
-    "Количество успешных входов в систему"
+# Метрики Centrifugo
+centrifugo_publish_total = Counter(
+    'centrifugo_publish_total',
+    'Общее количество публикаций в Centrifugo',
+    ['channel_type', 'status'],
+    registry=registry
 )
 
-LOGIN_FAILURE = Counter(
-    "app_login_failure", 
-    "Количество неудачных попыток входа"
+centrifugo_publish_duration_seconds = Histogram(
+    'centrifugo_publish_duration_seconds',
+    'Длительность публикации в Centrifugo в секундах',
+    ['channel_type'],
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, float('inf')),
+    registry=registry
 )
 
-# Метрики сессий
-ACTIVE_SESSIONS = Gauge(
-    "app_active_sessions", 
-    "Количество активных сессий"
+# Метрики базы данных
+db_query_duration_seconds = Histogram(
+    'db_query_duration_seconds',
+    'Длительность запросов к базе данных в секундах',
+    ['operation', 'table'],
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, float('inf')),
+    registry=registry
 )
 
-# Метрики сообщений
-MESSAGE_COUNT = Counter(
-    "app_message_count", 
-    "Количество отправленных сообщений"
+db_errors_total = Counter(
+    'db_errors_total',
+    'Общее количество ошибок базы данных',
+    ['operation', 'error_type'],
+    registry=registry
 )
 
-# Метрики системных ресурсов
-MEMORY_USAGE = Gauge(
-    "app_memory_usage_bytes", 
-    "Использование памяти приложением (байты)"
+# Бизнес-метрики
+messages_sent_total = Counter(
+    'messages_sent_total',
+    'Общее количество отправленных сообщений',
+    ['chat_type'],
+    registry=registry
 )
 
-CPU_USAGE = Gauge(
-    "app_cpu_usage_percent", 
-    "Использование CPU приложением (%)"
-)
-
-DB_QUERY_TIME = Summary(
-    "app_db_query_time_seconds", 
-    "Время выполнения запросов к БД",
-    ["query_type"]
-)
-
-REDIS_OPERATION_TIME = Summary(
-    "app_redis_operation_time_seconds", 
-    "Время выполнения операций с Redis",
-    ["operation_type"]
-)
-
-# Метрики для кэширования
-CACHE_HIT = Counter(
-    "app_cache_hit", 
-    "Количество успешных обращений к кэшу",
-    ["cache_type"]
-)
-
-CACHE_MISS = Counter(
-    "app_cache_miss", 
-    "Количество промахов кэша",
-    ["cache_type"]
+active_users_gauge = Gauge(
+    'active_users',
+    'Количество активных пользователей',
+    registry=registry
 )
 
 
-# Middleware для сбора метрик HTTP-запросов
-class PrometheusMiddleware(BaseHTTPMiddleware):
+async def metrics_middleware(request: Request, call_next) -> Response:
     """
-    Middleware для сбора метрик HTTP-запросов
-    
-    Собирает информацию о количестве запросов и времени их обработки
-    """
-    
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        # Не собираем метрики для запросов к эндпоинту метрик
-        if request.url.path == settings.METRICS_PATH:
-            return await call_next(request)
-        
-        # Фиксируем начало выполнения запроса
-        start_time = time.time()
-        
-        # Выполняем запрос
-        try:
-            response = await call_next(request)
-            
-            # Формируем метки для метрик
-            method = request.method
-            endpoint = request.url.path
-            status = response.status_code
-            
-            # Увеличиваем счетчик запросов
-            REQUEST_COUNT.labels(
-                method=method, 
-                endpoint=endpoint, 
-                status=status
-            ).inc()
-            
-            # Фиксируем время выполнения запроса
-            duration = time.time() - start_time
-            REQUEST_LATENCY.labels(
-                method=method, 
-                endpoint=endpoint
-            ).observe(duration)
-            
-            return response
-        
-        except Exception as e:
-            # В случае ошибки также фиксируем метрики
-            method = request.method
-            endpoint = request.url.path
-            status = 500  # Internal Server Error
-            
-            # Увеличиваем счетчик запросов
-            REQUEST_COUNT.labels(
-                method=method, 
-                endpoint=endpoint, 
-                status=status
-            ).inc()
-            
-            # Фиксируем время выполнения запроса
-            duration = time.time() - start_time
-            REQUEST_LATENCY.labels(
-                method=method, 
-                endpoint=endpoint
-            ).observe(duration)
-            
-            # Передаем исключение дальше
-            raise
-
-
-# Функция для настройки метрик в приложении
-def setup_metrics(app: FastAPI) -> None:
-    """
-    Настраивает сбор метрик для FastAPI-приложения
+    Middleware для сбора метрик HTTP запросов
     
     Args:
-        app: FastAPI-приложение
+        request: Объект запроса FastAPI
+        call_next: Следующая функция в цепочке middleware
+        
+    Returns:
+        Response: Ответ FastAPI
     """
-    # Добавляем middleware для сбора метрик
-    app.add_middleware(PrometheusMiddleware)
+    start_time = time.time()
     
-    # Добавляем маршрут для экспорта метрик в формате Prometheus
-    @app.get(settings.METRICS_PATH, include_in_schema=False)
-    async def metrics():
-        return Response(
-            content=generate_latest(),
-            media_type="text/plain"
-        )
+    try:
+        response = await call_next(request)
+        
+        # Получаем путь запроса без параметров запроса
+        path = request.url.path
+        
+        # Для API эндпоинтов с динамическими параметрами (например, /api/v1/users/{id})
+        # заменяем конкретные значения на {id} для группировки метрик
+        if '/api/v1/' in path:
+            parts = path.split('/')
+            for i, part in enumerate(parts):
+                # Если часть пути похожа на UUID или число, заменяем на {id}
+                if (i > 0 and 
+                    (part.isdigit() or 
+                     (len(part) > 8 and '-' in part))):
+                    parts[i] = '{id}'
+            path = '/'.join(parts)
+        
+        # Записываем метрики
+        http_requests_total.labels(
+            method=request.method,
+            endpoint=path,
+            status=response.status_code
+        ).inc()
+        
+        http_request_duration_seconds.labels(
+            method=request.method,
+            endpoint=path
+        ).observe(time.time() - start_time)
+        
+        return response
+    except Exception as e:
+        # В случае ошибки также записываем метрики
+        logger.error(f"Ошибка при обработке запроса: {str(e)}")
+        http_requests_total.labels(
+            method=request.method,
+            endpoint=request.url.path,
+            status=500
+        ).inc()
+        
+        http_request_duration_seconds.labels(
+            method=request.method,
+            endpoint=request.url.path
+        ).observe(time.time() - start_time)
+        
+        raise
+
+
+def track_db_query(operation: str, table: str) -> Callable:
+    """
+    Декоратор для отслеживания запросов к базе данных
     
-    logger.info("Метрики Prometheus настроены")
+    Args:
+        operation: Тип операции (select, insert, update, delete)
+        table: Имя таблицы
+        
+    Returns:
+        Callable: Декорированная функция
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
+            
+            try:
+                result = await func(*args, **kwargs)
+                
+                # Записываем метрику длительности запроса
+                db_query_duration_seconds.labels(
+                    operation=operation,
+                    table=table
+                ).observe(time.time() - start_time)
+                
+                return result
+            except Exception as e:
+                # В случае ошибки записываем метрику ошибки
+                error_type = type(e).__name__
+                db_errors_total.labels(
+                    operation=operation,
+                    error_type=error_type
+                ).inc()
+                
+                # Записываем метрику длительности запроса
+                db_query_duration_seconds.labels(
+                    operation=operation,
+                    table=table
+                ).observe(time.time() - start_time)
+                
+                raise
+        
+        return wrapper
+    
+    return decorator
 
 
-# Функции-помощники для сбора метрик
+def track_centrifugo_publish(channel: str, status: str = "success") -> None:
+    """
+    Отслеживание публикации в Centrifugo
+    
+    Args:
+        channel: Канал Centrifugo
+        status: Статус публикации (success/error)
+    """
+    # Определяем тип канала
+    channel_type = "unknown"
+    if channel.startswith("chat:"):
+        channel_type = "chat"
+    elif channel.startswith("user:"):
+        channel_type = "user"
+    elif channel.startswith("presence:"):
+        channel_type = "presence"
+    
+    # Записываем метрику
+    centrifugo_publish_total.labels(
+        channel_type=channel_type,
+        status=status
+    ).inc()
 
-def track_login_success() -> None:
-    """Увеличивает счетчик успешных входов в систему"""
-    LOGIN_SUCCESS.inc()
 
-
-def track_login_failure() -> None:
-    """Увеличивает счетчик неудачных попыток входа"""
-    LOGIN_FAILURE.inc()
-
-
-def set_active_sessions(count: int) -> None:
-    """Устанавливает количество активных сессий"""
-    ACTIVE_SESSIONS.set(count)
-
-
-def track_message_sent() -> None:
-    """Увеличивает счетчик отправленных сообщений"""
-    MESSAGE_COUNT.inc()
+def track_centrifugo_publish_time(channel: str, duration: float) -> None:
+    """
+    Отслеживание времени публикации в Centrifugo
+    
+    Args:
+        channel: Канал Centrifugo
+        duration: Длительность публикации в секундах
+    """
+    # Определяем тип канала
+    channel_type = "unknown"
+    if channel.startswith("chat:"):
+        channel_type = "chat"
+    elif channel.startswith("user:"):
+        channel_type = "user"
+    elif channel.startswith("presence:"):
+        channel_type = "presence"
+    
+    # Записываем метрику
+    centrifugo_publish_duration_seconds.labels(
+        channel_type=channel_type
+    ).observe(duration)
 
 
 def track_websocket_message(direction: str, message_type: str) -> None:
     """
-    Увеличивает счетчик сообщений через WebSocket
+    Отслеживание WebSocket сообщений
     
     Args:
-        direction: Направление сообщения ('sent' или 'received')
-        message_type: Тип сообщения (например, 'message', 'typing', 'read_receipt')
+        direction: Направление сообщения (incoming/outgoing)
+        message_type: Тип сообщения (message, typing, read, etc.)
     """
-    WEBSOCKET_MESSAGES.labels(
+    ws_messages_total.labels(
         direction=direction,
-        type=message_type
+        message_type=message_type
     ).inc()
 
 
-def set_websocket_connections(count: int) -> None:
+def track_message_sent(chat_type: str = "private") -> None:
     """
-    Устанавливает количество активных WebSocket-соединений
+    Отслеживание отправленных сообщений
     
     Args:
-        count: Количество соединений
+        chat_type: Тип чата (private/group)
     """
-    WEBSOCKET_CONNECTIONS.set(count)
+    messages_sent_total.labels(
+        chat_type=chat_type
+    ).inc()
 
 
-def track_db_query_time(query_type: str, duration: float) -> None:
+def update_active_users(count: int) -> None:
     """
-    Фиксирует время выполнения запроса к БД
+    Обновление количества активных пользователей
     
     Args:
-        query_type: Тип запроса (например, 'select', 'insert', 'update', 'delete')
-        duration: Время выполнения в секундах
+        count: Количество активных пользователей
     """
-    DB_QUERY_TIME.labels(query_type=query_type).observe(duration)
+    active_users_gauge.set(count)
 
 
-def track_redis_operation_time(operation_type: str, duration: float) -> None:
+def push_metrics(gateway_url: str, job: str) -> None:
     """
-    Фиксирует время выполнения операции с Redis
+    Отправка метрик в Prometheus Push Gateway
     
     Args:
-        operation_type: Тип операции (например, 'get', 'set', 'del', 'pub', 'sub')
-        duration: Время выполнения в секундах
+        gateway_url: URL Push Gateway
+        job: Имя задачи
     """
-    REDIS_OPERATION_TIME.labels(operation_type=operation_type).observe(duration)
-
-
-def track_cache_hit(cache_type: str) -> None:
-    """
-    Увеличивает счетчик успешных обращений к кэшу
-    
-    Args:
-        cache_type: Тип кэша (например, 'redis', 'memory')
-    """
-    CACHE_HIT.labels(cache_type=cache_type).inc()
-
-
-def track_cache_miss(cache_type: str) -> None:
-    """
-    Увеличивает счетчик промахов кэша
-    
-    Args:
-        cache_type: Тип кэша (например, 'redis', 'memory')
-    """
-    CACHE_MISS.labels(cache_type=cache_type).inc()
-
-
-def set_system_metrics(memory_bytes: int, cpu_percent: float) -> None:
-    """
-    Устанавливает метрики системных ресурсов
-    
-    Args:
-        memory_bytes: Использование памяти в байтах
-        cpu_percent: Использование CPU в процентах
-    """
-    MEMORY_USAGE.set(memory_bytes)
-    CPU_USAGE.set(cpu_percent) 
+    try:
+        push_to_gateway(gateway_url, job=job, registry=registry)
+        logger.info(f"Метрики успешно отправлены в Push Gateway: {gateway_url}")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке метрик в Push Gateway: {str(e)}") 

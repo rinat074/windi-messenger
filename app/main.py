@@ -4,14 +4,14 @@
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes import api_router
 from app.core.config import settings
 from app.core.logging import get_logger, setup_logging
-from app.core.metrics import setup_metrics
+from app.core.metrics import setup_metrics, metrics_middleware
 from app.core.monitoring import ResourceMonitor
 from app.core.redis import redis_manager
 from app.core.tasks import task_queue
@@ -89,7 +89,10 @@ app = FastAPI(
     title=settings.PROJECT_NAME,
     description=settings.PROJECT_DESCRIPTION,
     version=settings.PROJECT_VERSION,
-    lifespan=lifespan
+    lifespan=lifespan,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 # Настройка CORS
@@ -105,6 +108,11 @@ app.add_middleware(
 if settings.METRICS_ENABLED:
     setup_metrics(app)
     logger.info("Метрики Prometheus настроены")
+
+# Добавляем middleware для сбора метрик
+@app.middleware("http")
+async def add_metrics_middleware(request: Request, call_next):
+    return await metrics_middleware(request, call_next)
 
 # Обработчик необработанных исключений
 @app.exception_handler(Exception)
