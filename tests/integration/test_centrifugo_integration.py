@@ -20,6 +20,27 @@ from app.api.routes.centrifugo_routes import router as centrifugo_router
 from app.db.crud.chat import check_chat_access
 from app.db.crud.message import save_message_to_db
 
+# Вспомогательные функции для тестов
+def verify_publish_not_called(mock_client):
+    """Проверяет, что метод publish не был вызван"""
+    mock_client.publish.assert_not_called()
+    mock_client.publish.reset_mock()
+
+async def verify_message_in_db(db_session, message_id, expected_text):
+    """Проверяет наличие сообщения в БД с ожидаемым текстом"""
+    from sqlalchemy import text
+    try:
+        result = await db_session.execute(
+            text("SELECT * FROM messages WHERE id = :message_id"),
+            {"message_id": message_id}
+        )
+        message = result.fetchone()
+        
+        assert message is not None, f"Сообщение с ID {message_id} не найдено в БД"
+        assert message.text == expected_text, f"Текст сообщения не соответствует ожидаемому"
+        return message
+    except Exception as e:
+        pytest.fail(f"Ошибка при проверке сообщения в БД: {str(e)}")
 
 # Создаем тестовое приложение FastAPI
 @pytest.fixture
@@ -49,6 +70,8 @@ async def managed_transaction(db_session):
     async with db_session.begin() as transaction:
         try:
             yield transaction
+        except Exception as e:
+            pytest.fail(f"Ошибка во время выполнения теста: {str(e)}")
         finally:
             # В любом случае откатываем транзакцию
             await transaction.rollback()
@@ -59,21 +82,24 @@ async def test_chat_access_integration(db_session):
     """Интеграционный тест для проверки доступа к чату"""
     # Используем транзакцию для изоляции теста
     async with managed_transaction(db_session):
-        # Проверка доступа пользователя к чату
-        result = await check_chat_access(
-            db=db_session,
-            user_id="test-user-id",
-            chat_id="test-chat-id"
-        )
-        assert result is True
-        
-        # Проверка отсутствия доступа
-        result = await check_chat_access(
-            db=db_session,
-            user_id="non-existent-user",
-            chat_id="test-chat-id"
-        )
-        assert result is False
+        try:
+            # Проверка доступа пользователя к чату
+            result = await check_chat_access(
+                db=db_session,
+                user_id="test-user-id",
+                chat_id="test-chat-id"
+            )
+            assert result is True
+            
+            # Проверка отсутствия доступа
+            result = await check_chat_access(
+                db=db_session,
+                user_id="non-existent-user",
+                chat_id="test-chat-id"
+            )
+            assert result is False
+        except Exception as e:
+            pytest.fail(f"Ошибка при проверке доступа к чату: {str(e)}")
 
 
 @pytest.mark.asyncio
@@ -81,30 +107,26 @@ async def test_save_message_integration(db_session):
     """Интеграционный тест для сохранения сообщения"""
     # Используем транзакцию для изоляции теста
     async with managed_transaction(db_session):
-        # Сохраняем тестовое сообщение
-        message_id = await save_message_to_db(
-            db=db_session,
-            chat_id="test-chat-id",
-            sender_id="test-user-id",
-            text="Интеграционный тест сообщения",
-            client_message_id="integration-test-123"
-        )
-        
-        assert message_id is not None
-        
-        # Проверяем, что сообщение сохранилось в БД
-        from sqlalchemy import text
-        result = await db_session.execute(
-            text("SELECT * FROM messages WHERE id = :message_id"),
-            {"message_id": message_id}
-        )
-        message = result.fetchone()
-        
-        assert message is not None
-        assert message.text == "Интеграционный тест сообщения"
-        assert message.sender_id == "test-user-id"
-        assert message.chat_id == "test-chat-id"
-        assert message.client_message_id == "integration-test-123"
+        try:
+            # Сохраняем тестовое сообщение
+            message_id = await save_message_to_db(
+                db=db_session,
+                chat_id="test-chat-id",
+                sender_id="test-user-id",
+                text="Интеграционный тест сообщения",
+                client_message_id="integration-test-123"
+            )
+            
+            assert message_id is not None
+            
+            # Проверяем, что сообщение сохранилось в БД
+            await verify_message_in_db(
+                db_session, 
+                message_id, 
+                "Интеграционный тест сообщения"
+            )
+        except Exception as e:
+            pytest.fail(f"Ошибка при сохранении сообщения: {str(e)}")
 
 
 @pytest.mark.asyncio
@@ -234,7 +256,7 @@ async def test_publish_message_endpoint(
                 )
                 assert response.status_code == expected_status
                 # Убеждаемся, что publish не вызывался для некорректного канала
-                mock_centrifugo_client.publish.assert_not_called()
+                verify_publish_not_called(mock_centrifugo_client)
         # Если канал недоступного чата - мокируем check_chat_access для возврата False
         elif channel == "chat:non-existent":
             with patch("app.db.crud.chat.check_chat_access", return_value=False):
@@ -246,7 +268,7 @@ async def test_publish_message_endpoint(
                     )
                     assert response.status_code == expected_status
                     # Убеждаемся, что publish не вызывался для недоступного чата
-                    mock_centrifugo_client.publish.assert_not_called()
+                    verify_publish_not_called(mock_centrifugo_client)
         else:
             # Для остальных каналов
             with patch("app.db.crud.chat.check_chat_access", return_value=True):

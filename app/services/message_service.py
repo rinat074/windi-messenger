@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -21,7 +21,20 @@ class MessageService:
         self.chat_repo = ChatRepository(db)
     
     async def save_message(self, user_id: UUID, message_in: MessageCreate, chat_id: UUID) -> MessageResponse:
-        """Сохранение сообщения, отправленного через Centrifugo"""
+        """
+        Сохранение сообщения, отправленного через Centrifugo
+        
+        Args:
+            user_id: ID пользователя, отправляющего сообщение
+            message_in: Данные сообщения
+            chat_id: ID чата
+            
+        Returns:
+            Сохраненное сообщение
+            
+        Raises:
+            HTTPException: Если чат не найден, пользователь не имеет доступа или произошла ошибка
+        """
         logger.info(f"Сохранение сообщения от пользователя {user_id} в чат {chat_id}")
         
         # Проверка наличия чата и доступа пользователя к нему
@@ -34,61 +47,91 @@ class MessageService:
             )
         
         # Проверка, является ли пользователь участником чата
-        chat_users = [user.id for user in chat.users]
-        if user_id not in chat_users:
-            logger.warning(f"Пользователь {user_id} пытается отправить сообщение в чат {chat.id} без доступа")
+        chat_users = [str(user.id) for user in chat.users]
+        if str(user_id) not in chat_users:
+            logger.warning(f"Пользователь {user_id} не имеет доступа к чату {chat_id}")
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="У вас нет доступа к этому чату"
             )
         
-        # Сохранение сообщения с проверкой на дубликаты
-        if message_in.client_message_id:
-            logger.debug(f"Проверка на дубликат сообщения с client_message_id={message_in.client_message_id}")
+        # Валидация данных сообщения
+        self._validate_message_data(message_in)
         
-        message = await self.message_repo.save_message(
-            chat_id=chat_id,
-            sender_id=user_id,
-            text=message_in.text,
-            client_message_id=message_in.client_message_id
-        )
-        
-        # Проверяем, был ли это дубликат, сравнивая поля created_at и updated_at
-        # Если это дубликат, то created_at должно быть раньше, чем updated_at
-        is_duplicate = message_in.client_message_id and message.created_at != message.updated_at
-        
-        if is_duplicate:
-            logger.info(f"Обнаружен дубликат сообщения с client_message_id={message_in.client_message_id}")
-        else:
-            logger.info(f"Сообщение успешно сохранено: id={message.id}")
+        try:
+            # Сохранение сообщения в БД
+            message = await self.message_repo.create(
+                chat_id=chat_id,
+                sender_id=user_id,
+                **message_in.dict()
+            )
             
-            # Публикуем сообщение в Centrifugo
-            try:
-                channel = centrifugo_client.get_chat_channel_name(str(chat_id))
-                centrifugo_message = {
-                    "id": str(message.id),
-                    "chat_id": str(message.chat_id),
-                    "sender_id": str(message.sender_id),
-                    "text": message.text,
-                    "created_at": message.created_at.isoformat(),
-                    "is_read": message.is_read,
-                    "client_message_id": message.client_message_id
-                }
-                await centrifugo_client.publish(channel, centrifugo_message)
-                logger.info(f"Сообщение опубликовано в канал Centrifugo: {channel}")
-            except Exception as e:
-                logger.error(f"Ошибка при публикации сообщения в Centrifugo: {str(e)}")
+            # Публикация сообщения в Centrifugo
+            await self._publish_message_to_centrifugo(chat_id, message)
+            
+            return message
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении сообщения: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Ошибка при сохранении сообщения: {str(e)}"
+            )
+    
+    def _validate_message_data(self, message_in: MessageCreate) -> None:
+        """
+        Валидация данных сообщения
         
-        return MessageResponse(
-            id=message.id,
-            chat_id=message.chat_id,
-            sender_id=message.sender_id,
-            text=message.text,
-            created_at=message.created_at,
-            updated_at=message.updated_at,
-            is_read=message.is_read,
-            client_message_id=message.client_message_id
-        )
+        Args:
+            message_in: Данные сообщения
+            
+        Raises:
+            HTTPException: Если данные не проходят валидацию
+        """
+        # Проверка длины текста
+        if message_in.text and len(message_in.text) > 5000:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Текст сообщения слишком длинный (максимум 5000 символов)"
+            )
+        
+        # Проверка вложений
+        if message_in.attachments:
+            for attachment in message_in.attachments:
+                if not attachment.type or not attachment.url:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Вложение должно содержать тип и URL"
+                    )
+                
+                # Проверка URL вложения
+                if not attachment.url.startswith(("http://", "https://", "ftp://", "s3://")):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Некорректный URL вложения: {attachment.url}"
+                    )
+    
+    async def _publish_message_to_centrifugo(self, chat_id: UUID, message: MessageResponse) -> None:
+        """
+        Публикация сообщения в Centrifugo
+        
+        Args:
+            chat_id: ID чата
+            message: Сообщение для публикации
+        """
+        try:
+            # Формирование канала чата
+            chat_channel = f"chat:{chat_id}"
+            
+            # Публикация сообщения
+            await centrifugo_client.publish(
+                channel=chat_channel,
+                data=message.dict()
+            )
+            logger.info(f"Сообщение {message.id} опубликовано в канал {chat_channel}")
+        except Exception as e:
+            logger.error(f"Ошибка при публикации сообщения в Centrifugo: {str(e)}", exc_info=True)
+            # Не выбрасываем исключение, чтобы не блокировать сохранение сообщения
+            # Клиент может получить сообщение при следующей синхронизации
     
     async def get_chat_history(self, user_id: UUID, chat_id: UUID, limit: int = 50, offset: int = 0) -> List[MessageResponse]:
         """Получение истории сообщений чата с пагинацией"""
